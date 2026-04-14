@@ -1,0 +1,34 @@
+Loss_sim_wgt: 10
+batch_size_train: 8
+batch_size_val: 64
+distill_alpha: 1.0
+distill_beta: 0.5
+distill_delta: 0.5
+distill_gamma: 0.5
+embed_dim: 256
+image_res: 256
+loss_BIC_wgt: 1
+loss_MLC_wgt: 1
+loss_bbox_wgt: 0.1
+loss_giou_wgt: 0.1
+max_words: 50
+optimizer:
+  lr: 1.0e-05
+  lr_img: 5.0e-05
+  opt: adamW
+  weight_decay: 0.02
+schedular:
+  cooldown_epochs: 0
+  decay_rate: 1
+  epochs: 50
+  lr: 1.0e-05
+  min_lr: 1.0e-06
+  sched: cosine
+  warmup_epochs: 10
+  warmup_lr: 1.0e-06
+train_file:
+- ../../datasets/DGM4/metadata/train.json
+- ../../datasets/DGM4/metadata/val.json
+val_file:
+- ../../datasets/DGM4/metadata/test.json
+vision_width: 768

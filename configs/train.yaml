@@ -1,4 +1,4 @@
-train_file: ["../../datasets/DGM4/metadata/trainval.json"] # use train and val set together
+train_file: ["../../datasets/DGM4/metadata/train.json", "../../datasets/DGM4/metadata/val.json"] # use train and val set together
 val_file: ["../../datasets/DGM4/metadata/test.json"]           
 
 image_res: 256

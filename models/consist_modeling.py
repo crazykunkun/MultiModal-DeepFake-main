@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import pdb
-from .interaction import Self_Interaction
+from .interaction import Self_Interaction, FlashMultiheadAttention
 from timm.models.layers import trunc_normal_
 
 def calculate_patch_labels(images, boxes, fake_text_pos, num_patches=(16, 16)):
@@ -94,9 +94,9 @@ class Intra_Modal_Modeling(nn.Module):
                                                   nn.GELU(),
                                                   nn.Linear(128, 64))
         self.token_number = tok_num
-        self.aggregator = nn.MultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
+        self.aggregator = FlashMultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
         self.aggregator_mlp = self.build_mlp(input_dim=output_dim, output_dim=output_dim)
-        self.aggregator_2 = nn.MultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
+        self.aggregator_2 = FlashMultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
         self.aggregator_mlp_2 = self.build_mlp(input_dim=output_dim, output_dim=output_dim)
         self.num_head = 4
 
@@ -105,12 +105,12 @@ class Intra_Modal_Modeling(nn.Module):
             nn.Linear(input_dim, input_dim * 2),
             nn.LayerNorm(input_dim * 2),
             nn.GELU(),
-            nn.Linear(input_dim* 2, input_dim * 2),
+            nn.Linear(input_dim * 2, input_dim * 2),
             nn.LayerNorm(input_dim * 2),
             nn.GELU(),
             nn.Linear(input_dim * 2, output_dim)
         )
-    
+
     def forward(self, feats, mask, pos_emb, matrix_mask=None):
         
         B, N, C = feats.shape
@@ -191,16 +191,16 @@ class Extra_Modal_Modeling(nn.Module):
                                                   nn.Linear(128, 64))
         
         self.cls_token_cross = nn.Parameter(torch.zeros(1, 1, output_dim))
-        self.aggregator_cross = nn.MultiheadAttention(output_dim, num_head, dropout=0.0, batch_first=True)
+        self.aggregator_cross = FlashMultiheadAttention(output_dim, num_head, dropout=0.0, batch_first=True)
         self.norm_layer_cross =nn.LayerNorm(output_dim)
 
         self.cls_token_feat = nn.Parameter(torch.zeros(1, 1, output_dim))
-        self.aggregator_feat = nn.MultiheadAttention(output_dim, num_head, dropout=0.0, batch_first=True)
+        self.aggregator_feat = FlashMultiheadAttention(output_dim, num_head, dropout=0.0, batch_first=True)
         self.norm_layer_feat =nn.LayerNorm(output_dim)
 
-        self.aggregator = nn.MultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
+        self.aggregator = FlashMultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
         self.aggregator_mlp = self.build_mlp(input_dim=output_dim, output_dim=output_dim)
-        self.aggregator_2 = nn.MultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
+        self.aggregator_2 = FlashMultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
         self.aggregator_mlp_2 = self.build_mlp(input_dim=output_dim, output_dim=output_dim)
 
         trunc_normal_(self.cls_token_cross, std=.02)
@@ -211,12 +211,12 @@ class Extra_Modal_Modeling(nn.Module):
             nn.Linear(input_dim, input_dim * 2),
             nn.LayerNorm(input_dim * 2),
             nn.GELU(),
-            nn.Linear(input_dim* 2, input_dim * 2),
+            nn.Linear(input_dim * 2, input_dim * 2),
             nn.LayerNorm(input_dim * 2),
             nn.GELU(),
             nn.Linear(input_dim * 2, output_dim)
         )
-    
+
     def forward(self, feats, gloabl_feature, cross_feat, feats_mask, cross_mask):
         
         bs, _, _ = feats.shape

@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+from torch.cuda.amp import autocast, GradScaler
 
 import utils
 from dataset import create_dataset, create_sampler, create_loader
@@ -114,6 +115,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     # - 当前 epoch 各项损失/学习率的全局平均值（跨卡同步后）
     # train
     model.train()
+    scaler = GradScaler()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     # 注册需要持续追踪的训练指标（平滑窗口用于降低抖动，便于观察趋势）
@@ -152,17 +154,24 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
         
-        loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model(image, label, text_input, fake_image_box, fake_token_pos)
+        with autocast():
+            loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model(image, label, text_input, fake_image_box, fake_token_pos)
 
-        # 总损失 = 各子任务损失按配置权重线性加和
-        loss = config['loss_BIC_wgt']*loss_BIC \
-             + config['loss_bbox_wgt']*loss_bbox \
-             + config['loss_giou_wgt']*loss_giou \
-             + config['loss_MLC_wgt']*loss_MLC \
-             + config['Loss_sim_wgt']*Loss_sim\
-        
-        loss.backward()
-        optimizer.step()    
+            # 单模态预热阶段（前5个epoch）：只用BIC损失，让编码器先收敛
+            # 之后切换为全任务联合训练
+            if epoch < 5:
+                loss = config['loss_BIC_wgt'] * loss_BIC
+            else:
+                # 总损失 = 各子任务损失按配置权重线性加和
+                loss = config['loss_BIC_wgt']*loss_BIC \
+                     + config['loss_bbox_wgt']*loss_bbox \
+                     + config['loss_giou_wgt']*loss_giou \
+                     + config['loss_MLC_wgt']*loss_MLC \
+                     + config['Loss_sim_wgt']*Loss_sim
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()    
         
         metric_logger.update(loss_BIC=loss_BIC.item())
         metric_logger.update(loss_bbox=loss_bbox.item())
@@ -438,7 +447,16 @@ def main_worker(gpu, args, config):
     for epoch in range(start_epoch, max_epoch):
         # 每个 epoch：先训练，再在验证集评估，随后记录日志并保存最新 checkpoint
             
-        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
+        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer)
+
+        # 前 20 epoch 每 2 轮验证一次，之后每轮验证（节省约 10% 训练时间）
+        skip_eval = (epoch < 20 and epoch % 2 != 0)
+        if skip_eval:
+            if config['schedular']['sched'] != 'cosine_in_step':
+                lr_scheduler.step(epoch + warmup_steps + 1)
+            dist.barrier()
+            continue
+
         AUC_cls, ACC_cls, EER_cls, \
         MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \

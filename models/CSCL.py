@@ -271,7 +271,7 @@ class CSCL(nn.Module):
             itm_labels = torch.ones(bs, dtype=torch.long).to(image.device)
             itm_labels[real_label_pos] = 0 # fine-grained matching: only orig should be matched, 0 here means img-text matching
             vl_output = self.itm_head(fusion_token)   
-            loss_BIC = F.cross_entropy(vl_output, itm_labels) 
+            loss_BIC = F.cross_entropy(vl_output, itm_labels, label_smoothing=0.1)
 
             ##============ contextual consistancy ===========##
             image_atts = torch.ones(image_embeds_output.size()[:-1],dtype=torch.long).to(image.device)
@@ -372,3 +372,99 @@ class CSCL(nn.Module):
             logits_multicls_mask = ((logits_multicls[:, 0]<0.5)&(logits_multicls[:, 1]<0.5))
             output_coord[logits_multicls_mask] = torch.tensor([0.0, 0.0, 0.0, 0.0]).to(output_coord.device)
             return logits_real_fake, logits_multicls, output_coord, logits_tok
+
+    def forward_with_intermediates(self, image, label, text, fake_image_box, fake_text_pos):
+        """
+        蒸馏专用前向：和训练模式流程一致，但额外返回所有中间特征（用于教师/学生特征对齐）。
+        返回 dict，包含 5 个损失 + 所有中间张量。
+        """
+        ##================= multi-label convert ========================##
+        text_atts_mask_clone = text.attention_mask.clone()
+        text_atts_mask_bool = text_atts_mask_clone == 0
+
+        token_label = text.attention_mask[:, 1:].clone()
+        token_label[token_label == 0] = -100
+        token_label[token_label == 1] = 0
+
+        for batch_idx in range(len(fake_text_pos)):
+            fake_pos_sample = fake_text_pos[batch_idx]
+            if fake_pos_sample:
+                for pos in fake_pos_sample:
+                    token_label[batch_idx, pos] = 1
+
+        multicls_label, real_label_pos = get_multi_label(label, image)
+        sim_matrix_img, patch_label, _, _, _ = get_sscore_label(image, fake_image_box, token_label)
+        sim_matrix_text, sim_matrix_text_mask = get_sscore_label_text(token_label)
+
+        ##================= METER ========================##
+        batch = {}
+        batch["text_ids"] = text.input_ids
+        batch["text_masks"] = text.attention_mask
+
+        outputs = self.meter.infer(batch=batch, img=image)
+        text_embeds_output = outputs['text_feats']
+        image_embeds_output = outputs['image_feats']
+        fusion_token = self.fusion_head(outputs['cls_feats'])
+
+        ##================= BIC ========================##
+        with torch.no_grad():
+            bs = image.size(0)
+
+        itm_labels = torch.ones(bs, dtype=torch.long).to(image.device)
+        itm_labels[real_label_pos] = 0
+        vl_output = self.itm_head(fusion_token)
+        loss_BIC = F.cross_entropy(vl_output, itm_labels, label_smoothing=0.1)
+
+        ##============ contextual consistancy ===========##
+        image_atts = torch.ones(image_embeds_output.size()[:-1], dtype=torch.long).to(image.device)
+        image_atts_mask_bool = (image_atts == 0)
+        patch_pos_emb = self.emb_img_pos(pos2posemb2d(coords_2d(16, 16).to(fusion_token.device).unsqueeze(0).repeat(bs, 1, 1)))
+        img_patch_feat = image_embeds_output[:, 1:, :]
+        img_patch_feat, img_matrix_pred, _ = self.img_intra_model(img_patch_feat, image_atts_mask_bool[:, 1:], patch_pos_emb)
+        len_text = text_embeds_output.shape[1] - 1
+        token_pos_emb = self.emb_text_pos(score2posemb1d(torch.arange(0, len_text, dtype=torch.float).to(text_embeds_output.device).unsqueeze(1).repeat(bs, 1, 1)))
+        text_token_feat = text_embeds_output[:, 1:, :]
+        text_token_feat, text_matrix_pred, _ = self.text_intra_model(text_token_feat, text_atts_mask_bool[:, 1:], token_pos_emb, sim_matrix_text_mask)
+
+        Loss_img_matrix, _, _ = get_weighted_bce_loss(img_matrix_pred.view(-1), sim_matrix_img.float().view(-1))
+        Loss_text_matrix, _, _ = get_weighted_bce_loss(text_matrix_pred[sim_matrix_text_mask].view(-1), sim_matrix_text[sim_matrix_text_mask].view(-1).float())
+
+        ##============ semantic consistancy ===========##
+        agger_feat_img, sim_score_img, _ = self.img_extra_model(img_patch_feat, image_embeds_output[:, 0:1, :], text_token_feat, image_atts_mask_bool[:, 1:], text_atts_mask_bool[:, 1:])
+        agger_feat_text, sim_score_text, _ = self.text_extra_model(text_token_feat, text_embeds_output[:, 0:1, :], img_patch_feat, text_atts_mask_bool[:, 1:], image_atts_mask_bool[:, 1:])
+
+        Loss_img_score, _, _ = get_it_bce_loss(sim_score_img.view(-1), patch_label.view(-1).float())
+        Loss_text_score, _, _ = get_it_bce_loss(sim_score_text.view(-1), token_label.view(-1).float())
+
+        Loss_sim = Loss_img_score + Loss_img_matrix + Loss_text_score + Loss_text_matrix
+
+        ##================= IMG ========================##
+        output_coord = self.bbox_head(agger_feat_img.squeeze(1)).sigmoid()
+        loss_bbox, loss_giou = self.get_bbox_loss(output_coord, fake_image_box)
+        output_cls_img = self.cls_head_img(agger_feat_img.squeeze(1))
+        loss_MLC_img = F.binary_cross_entropy_with_logits(output_cls_img, multicls_label.type(torch.float)[:, :2])
+
+        ##================= TMG ========================##
+        output_cls_text = self.cls_head_text(agger_feat_text.squeeze(1))
+        loss_MLC_text = F.binary_cross_entropy_with_logits(output_cls_text, multicls_label.type(torch.float)[:, 2:])
+
+        ##================= MLC ========================##
+        loss_MLC = loss_MLC_img + loss_MLC_text
+
+        return {
+            'loss_BIC': loss_BIC,
+            'loss_bbox': loss_bbox,
+            'loss_giou': loss_giou,
+            'loss_MLC': loss_MLC,
+            'Loss_sim': Loss_sim,
+            'img_matrix_pred': img_matrix_pred,
+            'text_matrix_pred': text_matrix_pred,
+            'agger_feat_img': agger_feat_img,
+            'agger_feat_text': agger_feat_text,
+            'sim_score_img': sim_score_img,
+            'sim_score_text': sim_score_text,
+            'vl_output': vl_output,
+            'output_coord': output_coord,
+            'output_cls_img': output_cls_img,
+            'output_cls_text': output_cls_text,
+        }
