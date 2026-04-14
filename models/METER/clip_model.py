@@ -229,7 +229,7 @@ def build_model(name, resolution_after=224):
 #     else:
 #         raise RuntimeError(f"Model {name} not found; available models = {available_models()}"
 # )   
-    model_path = '../../../../model/ViT-B-16.pt'
+    model_path = 'D:/study/bishe/DEMO/model/ViT-B-16.pt'
     try:
         model = torch.jit.load(model_path, map_location="cpu")
         state_dict = None

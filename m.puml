@@ -1,0 +1,55 @@
+@startuml
+title 模型框架
+left to right direction
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam linetype ortho
+skinparam defaultFontName Microsoft YaHei
+skinparam rectangle {
+  RoundCorner 12
+  BorderColor #4B5563
+  BackgroundColor #F8FAFC
+}
+skinparam arrow {
+  Color #374151
+  Thickness 1
+}
+
+' ===== 输入 =====
+rectangle "图像输入\nImage" as IN_IMG #EEF2FF
+rectangle "文本输入\nText" as IN_TXT #ECFDF5
+
+' ===== 编码器 =====
+rectangle "多模态编码器\n(METER)" as ENCODER #E0E7FF
+
+' ===== 双CCD（并行） =====
+rectangle "CCD\n模态内上下文一致性" as CCD_IMG #FDECDC
+
+rectangle "CCD\n模态内上下文一致性" as CCD_TXT #E8F8EE
+
+' ===== SCD融合 =====
+rectangle "SCD\n(跨模态语义一致性融合)" as SCD #FEF3C7
+
+' ===== 输出 =====
+rectangle "输出结果" as OUT_MLC #F3F4F6
+
+
+' ===== 主链路 =====
+IN_IMG --> ENCODER
+IN_TXT --> ENCODER
+
+
+ENCODER --> CCD_IMG
+ENCODER --> CCD_TXT
+
+
+
+CCD_IMG --> SCD
+CCD_TXT --> SCD
+
+SCD --> OUT_MLC
+
+
+
+@enduml

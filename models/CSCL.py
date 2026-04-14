@@ -15,6 +15,8 @@ from torch.nn import CrossEntropyLoss, BCELoss
 from .consist_modeling import Intra_Modal_Modeling, Extra_Modal_Modeling
 import math
 import yaml
+
+# 将一维位置索引映射为正余弦位置编码（文本 token 使用）
 def score2posemb1d(pos, num_pos_feats=768, temperature=10000):
     scale = 2 * math.pi
     pos = pos * scale
@@ -26,6 +28,7 @@ def score2posemb1d(pos, num_pos_feats=768, temperature=10000):
 
     return pos_x
 
+# 将二维坐标映射为正余弦位置编码（图像 patch 使用）
 def pos2posemb2d(pos, num_pos_feats=768, temperature=10000):
     scale = 2 * math.pi
     pos = pos * scale
@@ -38,6 +41,7 @@ def pos2posemb2d(pos, num_pos_feats=768, temperature=10000):
     pos_xy = torch.cat((pos_y, pos_x), dim=-1)
     return pos_xy
 
+# 生成归一化的二维网格坐标，供图像 patch 位置编码使用
 def coords_2d(x_size, y_size):
     meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
     batch_y, batch_x = torch.meshgrid(*[torch.linspace(it[0], it[1], it[2]) for it in meshgrid])
@@ -48,6 +52,8 @@ def coords_2d(x_size, y_size):
     return coord_base
     
 def get_weighted_bce_loss(prediction, gt):
+    # 类别不平衡加权 BCE：前景/背景按 batch 内占比动态加权
+    # 返回：加权损失 + 近似精确率/召回率（用于监控）
     loss = nn.BCELoss(reduction='none')
 
     class_loss = loss(prediction, gt) 
@@ -68,6 +74,7 @@ def get_weighted_bce_loss(prediction, gt):
     return w_class_loss, P, R
 
 def get_it_bce_loss(prediction, gt):
+    # 文本/跨模态一致性分数监督损失：先去掉 padding(-100) 再做加权 BCE
     loss = nn.BCELoss(reduction='none')
     
     mask = (gt==-100)
@@ -92,20 +99,32 @@ def get_it_bce_loss(prediction, gt):
     return w_class_loss, P, R
 
 class CSCL(nn.Module):
-    def __init__(self, 
+    # CSCL = Contextual-Semantic Consistency Learning
+    # 作用：同时完成四类任务
+    # 1) 真伪二分类（BIC）
+    # 2) 图像篡改框定位（bbox）
+    # 3) 图文多标签篡改类型识别（MLC）
+    # 4) 文本 token 级篡改定位（text grounding）
+    # 原理：先用多模态编码器提取图文联合特征，再通过
+    # - 模态内一致性建模（CCD）
+    # - 跨模态语义一致性建模（SCD）
+    # 强化“细粒度篡改线索”，最后由多任务头联合优化。
+    def __init__(self,
                  args = None, 
                  config = None,               
                  ):
         super().__init__()
        
         config_meter = yaml.load(open('configs/METER.yaml', 'r'), Loader=yaml.Loader) # Multi-modal Encoder
-        
+        # METER 作为图文联合编码器，提供 image/text/class token 特征
+
         self.args = args      
         embed_dim = config['embed_dim']
         text_width = config_meter['input_text_embed_size'] # text_width = vision_width
         vision_width = config_meter['input_image_embed_size']
 
         self.fusion_head = self.build_mlp(input_dim=text_width+text_width, output_dim=text_width)
+        # 融合头：将 METER 的 cls 融合特征映射到统一维度
 
         # creat itm head
         self.itm_head = self.build_mlp(input_dim=text_width, output_dim=2)
@@ -117,11 +136,13 @@ class CSCL(nn.Module):
         self.cls_head_img = self.build_mlp(input_dim=text_width, output_dim=2)
         self.cls_head_text = self.build_mlp(input_dim=text_width, output_dim=2)
 
-        # intra_modeling
+        # intra_modeling：模态内一致性（CCD）
+        # 图像分支：patch-patch 上下文一致性
+        # 文本分支：token-token 上下文一致性
         self.img_intra_model = Intra_Modal_Modeling(12, 1024, vision_width, vision_width, 16)
         self.text_intra_model = Intra_Modal_Modeling(12, 1024, vision_width, vision_width, 8)
 
-        # extra_modeling
+        # extra_modeling：跨模态语义一致性（SCD）
         self.img_extra_model = Extra_Modal_Modeling(12, vision_width, 16)
         self.text_extra_model = Extra_Modal_Modeling(12, vision_width, 8)
         
@@ -168,6 +189,8 @@ class CSCL(nn.Module):
         Args:
             image_embeds: encoding full images
         """
+        # 框定位损失：L1 + GIoU
+        # output_coord/target_bbox 均为 cxcywh 归一化坐标
         loss_bbox = F.l1_loss(output_coord, target_bbox, reduction='none')  # bsz, 4
 
         boxes1 = box_ops.box_cxcywh_to_xyxy(output_coord)
@@ -205,9 +228,12 @@ class CSCL(nn.Module):
         return sim_score, patch_score, img_score
     
     def forward(self, image, label, text, fake_image_box, fake_text_pos, is_train=True):
+        # 训练模式：返回 5 个损失分量
+        # 推理模式：返回四类预测(logits_real_fake, logits_multicls, output_coord, logits_tok)
         if is_train:
             
-            ##================= multi-label convert ========================## 
+            ##================= multi-label convert ========================##
+            # 标签准备：将文本注意力掩码与伪造 token 位置组合，得到 token-level 监督信号
 
             text_atts_mask_clone = text.attention_mask.clone() # [:,1:] for ingoring class token
             text_atts_mask_bool = text_atts_mask_clone==0 # 0 = pad token 
@@ -225,7 +251,8 @@ class CSCL(nn.Module):
             multicls_label, real_label_pos = get_multi_label(label, image)
             sim_matrix_img, patch_label, _, _, _ = get_sscore_label(image, fake_image_box,token_label)
             sim_matrix_text, sim_matrix_text_mask = get_sscore_label_text(token_label)
-            ##================= METER ========================## 
+            ##================= METER ========================##
+            # 多模态编码：提取 text/image 细粒度特征与融合 cls 特征
             batch={}
             batch["text_ids"] = text.input_ids
             batch["text_masks"] = text.attention_mask
@@ -235,7 +262,8 @@ class CSCL(nn.Module):
             image_embeds_output = outputs['image_feats']
             fusion_token = self.fusion_head(outputs['cls_feats'])
  
-            ##================= BIC ========================## 
+            ##================= BIC ========================##
+            # 二分类分支：预测图文对是否为真实一致对
             # forward the positve image-text pair          
             with torch.no_grad():
                 bs = image.size(0)          
@@ -285,12 +313,14 @@ class CSCL(nn.Module):
 
         else:
             
-            ##================= multi-label convert ========================## 
+            ##================= multi-label convert ========================##
+            # 标签准备：将文本注意力掩码与伪造 token 位置组合，得到 token-level 监督信号
 
             text_atts_mask_clone = text.attention_mask.clone() # [:,1:] for ingoring class token
             text_atts_mask_bool = text_atts_mask_clone==0 # 0 = pad token 
             sim_matrix_text_mask = ((text_atts_mask_bool[:,1:].unsqueeze(-1) + text_atts_mask_bool[:,1:].unsqueeze(-1).transpose(2,1))==0)
-            ##================= METER ========================## 
+            ##================= METER ========================##
+            # 多模态编码：提取 text/image 细粒度特征与融合 cls 特征
             batch={}
             batch["text_ids"] = text.input_ids
             batch["text_masks"] = text.attention_mask
@@ -300,7 +330,8 @@ class CSCL(nn.Module):
             image_embeds_output = outputs['image_feats']
             fusion_token = self.fusion_head(outputs['cls_feats'])
  
-            ##================= BIC ========================## 
+            ##================= BIC ========================##
+            # 二分类分支：预测图文对是否为真实一致对
             # forward the positve image-text pair          
             with torch.no_grad():
                 bs = image.size(0)          

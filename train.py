@@ -1,9 +1,11 @@
 import warnings
+# 忽略运行期告警，减少训练日志噪声（调试阶段可按需关闭）
 warnings.filterwarnings("ignore")
 
 import os
 # os.environ['CUDA_VISIBLE_DEVICES']='0,1,2,3'
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# 关闭 tokenizer 并行提示，避免多进程下反复打印警告信息
 import pdb
 
 import argparse
@@ -44,6 +46,9 @@ from models.CSCL import CSCL
 from transformers import RobertaTokenizerFast
 
 def setlogger(log_file):
+    # 配置日志：同时输出到文件和控制台，并扩展 epochInfo 便捷接口
+    # - 文件日志：便于训练后复盘
+    # - 控制台日志：便于实时观察
     filehandler = logging.FileHandler(log_file)
     streamhandler = logging.StreamHandler()
 
@@ -66,6 +71,9 @@ def setlogger(log_file):
 
 
 def text_input_adjust(text_input, fake_word_pos, device):
+    # 将 tokenizer 输出调整为模型需要的格式：去掉 SEP、重新 padding、构造伪造 token 位置
+    # 目标：把“按词标注的伪造位置(fake_word_pos)”映射成“按子词 token 的位置”
+    # 这样模型的 token-level 分支才能和文本输入严格对齐
     # input_ids adaptation
     input_ids_remove_SEP = [x[:-1] for x in text_input.input_ids]
     maxlen = max([len(x) for x in text_input.input_ids])-1
@@ -98,10 +106,17 @@ def text_input_adjust(text_input, fake_word_pos, device):
 
 
 def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer):
+    # 单个 epoch 的训练流程：前向、损失加权、反向传播、指标统计与日志记录
+    # 输入：
+    # - data_loader: 每次返回(image, label, text, fake_image_box, fake_word_pos, W, H, image_path)
+    # - tokenizer: 将原始文本转为 token
+    # 输出：
+    # - 当前 epoch 各项损失/学习率的全局平均值（跨卡同步后）
     # train
-    model.train()  
-    
+    model.train()
+
     metric_logger = utils.MetricLogger(delimiter="  ")
+    # 注册需要持续追踪的训练指标（平滑窗口用于降低抖动，便于观察趋势）
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.6f}'))
     metric_logger.add_meter('loss_BIC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_bbox', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
@@ -115,6 +130,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     step_size = 100
     warmup_iterations = warmup_steps*step_size  
 
+    # 全局步数用于 tensorboard 横轴（跨 epoch 累计）
     global_step = epoch*len(data_loader)
     
     if args.distributed:
@@ -122,19 +138,23 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
 
     for i, (image, label, text, fake_image_box, fake_word_pos, W, H, image_path) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
 
+        # 按 iteration 调整学习率（仅 cosine_in_step 策略）
         if config['schedular']['sched'] == 'cosine_in_step':
             scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + epoch, args, config)        
 
         optimizer.zero_grad()
-        
+
+        # 图像送入 GPU，文本走 tokenizer 并对齐到模型输入格式
+        # text_input_adjust 会把“词级伪造标签”映射到“token级伪造标签”
         image = image.to(device,non_blocking=True) 
         
         text_input = tokenizer(text, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False) 
         
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
         
-        loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model(image, label, text_input, fake_image_box, fake_token_pos)  
-            
+        loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model(image, label, text_input, fake_image_box, fake_token_pos)
+
+        # 总损失 = 各子任务损失按配置权重线性加和
         loss = config['loss_BIC_wgt']*loss_BIC \
              + config['loss_bbox_wgt']*loss_bbox \
              + config['loss_giou_wgt']*loss_giou \
@@ -182,6 +202,8 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
 
 @torch.no_grad()
 def evaluation(args, model, data_loader, tokenizer, device, config):
+    # 验证流程：计算真实/伪造分类、多标签分类、框定位与 token 级别检测等指标
+    # 注意：@torch.no_grad() 下不计算梯度，仅做前向推理与指标统计
     # test
     model.eval() 
     
@@ -189,6 +211,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     header = 'Evaluation:'    
     
     print('Computing features for evaluation...')
+    # 逐批次前向推理并累计各任务指标所需统计量
     start_time = time.time()   
     print_freq = 200 
 
@@ -213,6 +236,11 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
 
         logits_real_fake, logits_multicls, output_coord, logits_tok, _ = model(image, label, text_input, fake_image_box, fake_token_pos, is_train=False)
+        # 模型一次前向返回多任务输出：
+        # - logits_real_fake: 真伪二分类
+        # - logits_multicls: 多标签类别预测
+        # - output_coord: 预测篡改框
+        # - logits_tok: token 级伪造检测
 
         ##================= real/fake cls ========================## 
         cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
@@ -271,25 +299,29 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         FP_all += torch.sum((token_label_reshape == 0) * (logits_tok_pred == 1)).item()
         FN_all += torch.sum((token_label_reshape == 1) * (logits_tok_pred == 0)).item()
 
-    ##================= real/fake cls ========================## 
+    ##================= real/fake cls ========================##
+    # 汇总二分类 AUC/ACC/EER
     y_true, y_pred = np.array(y_true), np.array(y_pred)
     AUC_cls = roc_auc_score(y_true, y_pred)
     ACC_cls = cls_acc_all / cls_nums_all
     fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
     EER_cls = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
     
-    ##================= multi-label cls ========================## 
+    ##================= multi-label cls ========================##
+    # 计算多标签 mAP 与整体/Top-k 指标
     MAP = multi_label_meter.value().mean()
     OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
     OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k = multi_label_meter.overall_topk(3)
     
     ##================= bbox cls ========================##
+    # 计算框定位平均 IoU 与不同阈值下命中率
     IOU_score = sum(IOU_pred)/len(IOU_pred)
     IOU_ACC_50 = sum(IOU_50)/len(IOU_50)
     IOU_ACC_75 = sum(IOU_75)/len(IOU_75)
     IOU_ACC_95 = sum(IOU_95)/len(IOU_95)
 
     # ##================= token cls========================##
+    # 根据 TP/TN/FP/FN 计算 token 级准确率、精确率、召回率与 F1
     ACC_tok = (TP_all + TN_all) / (TP_all + TN_all + FP_all + FN_all)
     Precision_tok = TP_all / (TP_all + FP_all)
     Recall_tok = TP_all / (TP_all + FN_all)
@@ -301,11 +333,14 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
            ACC_tok, Precision_tok, Recall_tok, F1_tok
     
 def main_worker(gpu, args, config):
+    # 训练主进程：初始化分布式环境、构建数据与模型、执行训练与验证循环、保存日志与权重
+    # 这是完整训练生命周期的调度入口（每个进程/每张卡都会进入该函数）
 
     if gpu is not None:
         args.gpu = gpu
 
     init_dist(args)
+    # 创建当前实验日志目录，并保存运行配置
     log_dir = os.path.join(args.output_dir, 'log'+ args.log_num)
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, 'shell.txt')
@@ -328,6 +363,7 @@ def main_worker(gpu, args, config):
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
+    # 不同 rank 使用不同 seed（基础 seed + rank），保证多卡下随机性可控且可复现
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -338,7 +374,8 @@ def main_worker(gpu, args, config):
     max_epoch = config['schedular']['epochs']
     warmup_steps = config['schedular']['warmup_epochs']
 
-    #### Dataset #### 
+    #### Dataset ####
+    # 构建训练集/验证集；分布式训练时为训练集创建分布式采样器
     if args.log:
         print("Creating dataset")
     train_dataset, val_dataset = create_dataset(config)
@@ -356,7 +393,8 @@ def main_worker(gpu, args, config):
                                 collate_fns=[None, None])
 
     tokenizer = RobertaTokenizerFast.from_pretrained(args.text_encoder)
-    #### Model #### 
+    #### Model ####
+    # 实例化 CSCL 多模态模型并移动到目标设备
     if args.log:
         print(f"Creating CSCL")
     model = CSCL(args=args, config=config)
@@ -369,7 +407,8 @@ def main_worker(gpu, args, config):
     if config['schedular']['sched'] == 'cosine_in_step':
         args.lr = config['optimizer']['lr']
     
-    if args.checkpoint:    
+    if args.checkpoint:
+        # 可选：从 checkpoint 恢复模型；若 --resume=True 同时恢复优化器/调度器/起始 epoch
         checkpoint = torch.load(args.checkpoint, map_location='cpu') 
         state_dict = checkpoint['model']                       
         if args.resume:
@@ -382,9 +421,12 @@ def main_worker(gpu, args, config):
             print('load checkpoint from %s'%args.checkpoint)  
         msg = model.load_state_dict(state_dict, strict=False)
         if args.log:
-            print(msg)  
+            print(msg)
 
     model_without_ddp = model
+    # 保存“未被 DDP 包装”的模型引用：
+    # - 评估时直接调用原始模型
+    # - 保存权重时获取干净的 state_dict
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
@@ -394,6 +436,7 @@ def main_worker(gpu, args, config):
     start_time = time.time()
 
     for epoch in range(start_epoch, max_epoch):
+        # 每个 epoch：先训练，再在验证集评估，随后记录日志并保存最新 checkpoint
             
         train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
         AUC_cls, ACC_cls, EER_cls, \
@@ -460,7 +503,8 @@ def main_worker(gpu, args, config):
                      "F1_tok": "{:.4f}".format(F1_tok*100),
         }
         
-        if utils.is_main_process(): 
+        if utils.is_main_process():
+            # 仅主进程负责落盘，避免多进程重复写文件
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                             **{f'val_{k}': v for k, v in val_stats.items()},
                             'epoch': epoch,
@@ -499,6 +543,11 @@ def main_worker(gpu, args, config):
         print('Training time {}'.format(total_time_str))
 
 if __name__ == '__main__':
+    # 解析训练参数并根据 launcher 方式启动单机或多进程训练
+    # 入口逻辑：
+    # 1) 读取命令行参数
+    # 2) 加载 YAML 配置
+    # 3) 按 launcher 选择单进程或多进程启动
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='./configs/train.yaml')
     parser.add_argument('--checkpoint', default=False) 
@@ -525,9 +574,11 @@ if __name__ == '__main__':
 
     # main(args, config)
     if args.launcher == 'none':
+        # 兼容逻辑：未显式指定 launcher 时，默认按 pytorch 单进程入口执行
         args.launcher = 'pytorch'
         main_worker(0, args, config)
     else:
+        # 多 GPU 场景：为每张卡启动一个子进程，并行执行 main_worker
         ngpus_per_node = torch.cuda.device_count()
         args.ngpus_per_node = ngpus_per_node
         mp.spawn(main_worker, nprocs=ngpus_per_node, args=(args, config))
