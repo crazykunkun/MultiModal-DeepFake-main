@@ -12,7 +12,7 @@ resolution_before: 256
 # Text Setting
 vqav2_label_size: 3129
 max_text_len: 50
-tokenizer: "D:/study/bishe/DEMO/model/roberta-base"
+tokenizer: "roberta-base"
 vocab_size: 50265
 whole_word_masking: False # note that whole_word_masking does not work for RoBERTa
 mlm_prob: 0.15
@@ -23,9 +23,10 @@ num_top_layer: 6
 input_image_embed_size: 768
 input_text_embed_size: 768
 vit: 'ViT-B/16'
+vit_model_path: "ViT-B-16.pt"
 hidden_size: 768
 num_heads: 12
 num_layers: 6
 mlp_ratio: 4
 drop_rate: 0.1
-load_path: "D:/study/bishe/DEMO/model/meter_clip16_224_roberta_pretrain.ckpt"
+load_path: "meter_clip16_224_roberta_pretrain.ckpt"

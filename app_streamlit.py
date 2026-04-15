@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 import io
 import base64
+import yaml
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -13,10 +14,13 @@ from infer_single import load_inference_runtime, run_single_inference
 st.set_page_config(page_title="CSCL 多模态真伪检测", layout="wide")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-MODEL_ROOT = Path("D:/study/bishe/DEMO/model")
+DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "test.yaml"
+
+# 从 config 读取 model_root
+_cfg = yaml.load(open(str(DEFAULT_CONFIG), 'r'), Loader=yaml.Loader)
+MODEL_ROOT = Path(_cfg.get('model_root', str(PROJECT_ROOT / "model")))
 DEFAULT_CHECKPOINT = MODEL_ROOT / "checkpoint_49.pth"
 DEFAULT_TEXT_ENCODER = MODEL_ROOT / "roberta-base"
-DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "test.yaml"
 
 
 def format_runtime_error(exc: Exception) -> str:
@@ -24,11 +28,11 @@ def format_runtime_error(exc: Exception) -> str:
     hints = []
 
     if "ViT-B-16.pt" in raw:
-        hints.append("缺少 ViT-B-16.pt，请确认文件位于 D:/study/bishe/DEMO/model/ViT-B-16.pt。")
+        hints.append(f"缺少 ViT-B-16.pt，请确认文件位于 {MODEL_ROOT / 'ViT-B-16.pt'}。")
     if "meter_clip16_224_roberta_pretrain.ckpt" in raw:
-        hints.append("缺少 meter_clip16_224_roberta_pretrain.ckpt，请确认文件位于 D:/study/bishe/DEMO/model/。")
+        hints.append(f"缺少 meter_clip16_224_roberta_pretrain.ckpt，请确认文件位于 {MODEL_ROOT}。")
     if "roberta-base" in raw:
-        hints.append("未找到 roberta-base 目录，请确认目录位于 D:/study/bishe/DEMO/model/roberta-base。")
+        hints.append(f"未找到 roberta-base 目录，请确认目录位于 {DEFAULT_TEXT_ENCODER}。")
     if "CUDA is unavailable" in raw:
         hints.append("当前环境没有可用 CUDA，请选择 auto（自动回退 CPU）或直接选择 cpu。")
 

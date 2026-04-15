@@ -306,9 +306,9 @@ def main_worker(gpu, args, config):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='./configs/train.yaml')
-    parser.add_argument('--teacher_checkpoint', default='D:/study/bishe/DEMO/model/checkpoint_49.pth')
+    parser.add_argument('--teacher_checkpoint', default=None, help='override config teacher_checkpoint')
     parser.add_argument('--output_dir', default='results')
-    parser.add_argument('--text_encoder', default='d:/study/bishe/DEMO/model/roberta-base')
+    parser.add_argument('--text_encoder', default=None, help='override config model_root/roberta-base')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=777, type=int)
     parser.add_argument('--distributed', default=False, type=bool)
@@ -323,6 +323,14 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+
+    # 从 config 中读取路径（命令行参数优先）
+    import os
+    model_root = config.get('model_root', '.')
+    if args.teacher_checkpoint is None:
+        args.teacher_checkpoint = config.get('teacher_checkpoint', os.path.join(model_root, 'checkpoint_49.pth'))
+    if args.text_encoder is None:
+        args.text_encoder = os.path.join(model_root, 'roberta-base')
 
     # 蒸馏超参（可在 config 中覆盖）
     config.setdefault('distill_alpha', 1.0)

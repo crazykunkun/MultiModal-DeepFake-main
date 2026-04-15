@@ -1,5 +1,10 @@
+# 路径配置（迁移时只改这里）
+dataset_root: "../../datasets"
+model_root: "D:/study/bishe/DEMO/model"
+teacher_checkpoint: "D:/study/bishe/DEMO/model/checkpoint_49.pth"
+
 train_file: ["../../datasets/DGM4/metadata/train.json", "../../datasets/DGM4/metadata/val.json"] # use train and val set together
-val_file: ["../../datasets/DGM4/metadata/test.json"]           
+val_file: ["../../datasets/DGM4/metadata/test.json"]
 
 image_res: 256
 vision_width: 768

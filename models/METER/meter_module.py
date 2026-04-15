@@ -56,7 +56,7 @@ class METERTransformerSS(nn.Module):
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 if self.is_clip:
-                    build_model(config['vit'], resolution_after=resolution_after)
+                    build_model(config['vit_model_path'], resolution_after=resolution_after)
                 else:
                     getattr(swin, self.hparams.config["vit"])(
                         pretrained=True, config=self.hparams.config,
@@ -70,7 +70,7 @@ class METERTransformerSS(nn.Module):
             torch.distributed.barrier()
 
         if self.is_clip:
-            self.vit_model = build_model(config['vit'], resolution_after=resolution_after)
+            self.vit_model = build_model(config['vit_model_path'], resolution_after=resolution_after)
         else:
             self.vit_model = getattr(swin, self.hparams.config["vit"])(
                 pretrained=True, config=self.hparams.config,

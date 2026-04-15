@@ -220,16 +220,15 @@ def adapt_position_encoding(model, patch_size=32, after=384,
     return model
 
 
-def build_model(name, resolution_after=224):
-    
+def build_model(model_path, resolution_after=224):
+
 #     if name in _MODELS:
 #         model_path = _download(_MODELS[name])
 #     elif os.path.isfile(name):
 #         model_path = name
 #     else:
 #         raise RuntimeError(f"Model {name} not found; available models = {available_models()}"
-# )   
-    model_path = 'D:/study/bishe/DEMO/model/ViT-B-16.pt'
+# )
     try:
         model = torch.jit.load(model_path, map_location="cpu")
         state_dict = None

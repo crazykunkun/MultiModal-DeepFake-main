@@ -12,6 +12,7 @@ from torch import nn
 import numpy as np
 import math
 import yaml
+import os
 
 from models import box_ops
 from tools.multilabel_metrics import get_multi_label
@@ -191,6 +192,11 @@ class CSCL_Student(nn.Module):
     def __init__(self, args=None, config=None):
         super().__init__()
         config_meter = yaml.load(open('configs/METER.yaml', 'r'), Loader=yaml.Loader)
+        # 用主 config 的 model_root 拼接 METER 中的相对路径
+        model_root = config.get('model_root', '.')
+        config_meter['tokenizer'] = os.path.join(model_root, config_meter['tokenizer'])
+        config_meter['vit_model_path'] = os.path.join(model_root, config_meter['vit_model_path'])
+        config_meter['load_path'] = os.path.join(model_root, config_meter['load_path'])
         self.args = args
         text_width = config_meter['input_text_embed_size']
         vision_width = config_meter['input_image_embed_size']

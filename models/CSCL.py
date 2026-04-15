@@ -15,6 +15,7 @@ from torch.nn import CrossEntropyLoss, BCELoss
 from .consist_modeling import Intra_Modal_Modeling, Extra_Modal_Modeling
 import math
 import yaml
+import os
 
 # 将一维位置索引映射为正余弦位置编码（文本 token 使用）
 def score2posemb1d(pos, num_pos_feats=768, temperature=10000):
@@ -116,6 +117,11 @@ class CSCL(nn.Module):
         super().__init__()
        
         config_meter = yaml.load(open('configs/METER.yaml', 'r'), Loader=yaml.Loader) # Multi-modal Encoder
+        # 用主 config 的 model_root 拼接 METER 中的相对路径
+        model_root = config.get('model_root', '.')
+        config_meter['tokenizer'] = os.path.join(model_root, config_meter['tokenizer'])
+        config_meter['vit_model_path'] = os.path.join(model_root, config_meter['vit_model_path'])
+        config_meter['load_path'] = os.path.join(model_root, config_meter['load_path'])
         # METER 作为图文联合编码器，提供 image/text/class token 特征
 
         self.args = args      

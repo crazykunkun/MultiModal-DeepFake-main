@@ -1,3 +1,7 @@
+# 路径配置（迁移时只改这里）
+dataset_root: "../../datasets"
+model_root: "D:/study/bishe/DEMO/model"
+
 train_file: ["../../datasets/DGM4/metadata/trainval.json"] # use train and val set together
 val_file: ["../../datasets/DGM4/metadata/test.json"]      
 
