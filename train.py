@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
-import torch.distributed as dist
+from torch.cuda.amp import autocast, GradScaler
 
 import utils
 from dataset import create_dataset, create_sampler, create_loader
@@ -46,14 +46,16 @@ from models.CSCL import CSCL
 from transformers import RobertaTokenizerFast
 
 def setlogger(log_file):
-    # 配置日志：同时输出到文件和控制台，并扩展 epochInfo 便捷接口
-    # - 文件日志：便于训练后复盘
-    # - 控制台日志：便于实时观察
     filehandler = logging.FileHandler(log_file)
     streamhandler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    filehandler.setFormatter(formatter)
+    streamhandler.setFormatter(formatter)
 
-    logger = logging.getLogger('')
+    logger = logging.getLogger('train')
     logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
     logger.addHandler(filehandler)
     logger.addHandler(streamhandler)
 
@@ -105,7 +107,86 @@ def text_input_adjust(text_input, fake_word_pos, device):
     return text_input, fake_token_pos_batch
 
 
-def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer):
+def get_stage_config(config, epoch):
+    stages_config = config.get('stages', {})
+    if not stages_config.get('enabled', False):
+        total_epochs = config['schedular']['epochs']
+        return {
+            'name': 'default',
+            'index': 0,
+            'start_epoch': 0,
+            'end_epoch': total_epochs,
+            'freeze': {'trainable_groups': ['all']},
+            'loss_weights': {
+                'loss_BIC_wgt': config['loss_BIC_wgt'],
+                'loss_bbox_wgt': config['loss_bbox_wgt'],
+                'loss_giou_wgt': config['loss_giou_wgt'],
+                'loss_MLC_wgt': config['loss_MLC_wgt'],
+                'Loss_sim_wgt': config['Loss_sim_wgt'],
+            },
+            'optimizer': {},
+            'schedular': {'epochs': total_epochs, 'warmup_epochs': config['schedular']['warmup_epochs']},
+        }
+
+    matched_stage = None
+    for index, stage in enumerate(stages_config.get('definitions', [])):
+        if stage['start_epoch'] <= epoch < stage['end_epoch']:
+            matched_stage = dict(stage)
+            matched_stage['index'] = index
+            break
+
+    if matched_stage is None:
+        raise ValueError(f'No stage config found for epoch {epoch}')
+
+    return matched_stage
+
+
+def merge_stage_optimizer_config(config, stage):
+    optimizer_config = dict(config['optimizer'])
+    optimizer_config.update(stage.get('optimizer', {}))
+    return optimizer_config
+
+
+def merge_stage_scheduler_config(config, stage):
+    scheduler_config = dict(config['schedular'])
+    scheduler_config.update(stage.get('schedular', {}))
+    return scheduler_config
+
+
+def get_stage_loss_weights(config, stage):
+    loss_weights = {
+        'loss_BIC_wgt': config['loss_BIC_wgt'],
+        'loss_bbox_wgt': config['loss_bbox_wgt'],
+        'loss_giou_wgt': config['loss_giou_wgt'],
+        'loss_MLC_wgt': config['loss_MLC_wgt'],
+        'Loss_sim_wgt': config['Loss_sim_wgt'],
+    }
+    loss_weights.update(stage.get('loss_weights', {}))
+    return loss_weights
+
+
+def build_optimizer_scheduler_for_stage(config, model_without_ddp, stage):
+    trainable_groups = stage.get('freeze', {}).get('trainable_groups', ['all'])
+    trainable_summary = model_without_ddp.set_trainable_groups(trainable_groups)
+
+    optimizer_config = merge_stage_optimizer_config(config, stage)
+    scheduler_config = merge_stage_scheduler_config(config, stage)
+
+    optimizer = create_optimizer(utils.AttrDict(optimizer_config), model_without_ddp)
+    scheduler, _ = create_scheduler(utils.AttrDict(scheduler_config), optimizer)
+    return optimizer, scheduler, optimizer_config, scheduler_config, trainable_summary
+
+
+def build_stage_state(config, epoch):
+    stage = get_stage_config(config, epoch)
+    loss_weights = get_stage_loss_weights(config, stage)
+    stage_state = dict(stage)
+    stage_state['loss_weights'] = loss_weights
+    stage_state['local_epoch'] = epoch - stage['start_epoch']
+    return stage_state
+
+
+def train(args, model, data_loader, optimizer, tokenizer, scaler, epoch, warmup_steps, device, scheduler, config, summary_writer, stage_info):
     # 单个 epoch 的训练流程：前向、损失加权、反向传播、指标统计与日志记录
     # 输入：
     # - data_loader: 每次返回(image, label, text, fake_image_box, fake_word_pos, W, H, image_path)
@@ -128,7 +209,8 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 100   
     step_size = 100
-    warmup_iterations = warmup_steps*step_size  
+    local_epoch = stage_info['local_epoch']
+    warmup_iterations = warmup_steps*step_size
 
     # 全局步数用于 tensorboard 横轴（跨 epoch 累计）
     global_step = epoch*len(data_loader)
@@ -140,9 +222,9 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
 
         # 按 iteration 调整学习率（仅 cosine_in_step 策略）
         if config['schedular']['sched'] == 'cosine_in_step':
-            scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + epoch, args, config)        
+            scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + local_epoch, args, config)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         # 图像送入 GPU，文本走 tokenizer 并对齐到模型输入格式
         # text_input_adjust 会把“词级伪造标签”映射到“token级伪造标签”
@@ -152,17 +234,18 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
         
-        loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model(image, label, text_input, fake_image_box, fake_token_pos)
+        with autocast(enabled=device.type == 'cuda'):
+            loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model(image, label, text_input, fake_image_box, fake_token_pos)
 
-        # 总损失 = 各子任务损失按配置权重线性加和
-        loss = config['loss_BIC_wgt']*loss_BIC \
-             + config['loss_bbox_wgt']*loss_bbox \
-             + config['loss_giou_wgt']*loss_giou \
-             + config['loss_MLC_wgt']*loss_MLC \
-             + config['Loss_sim_wgt']*Loss_sim\
-        
-        loss.backward()
-        optimizer.step()    
+            loss_weights = stage_info['loss_weights']
+            loss = loss_weights['loss_BIC_wgt']*loss_BIC \
+                 + loss_weights['loss_bbox_wgt']*loss_bbox \
+                 + loss_weights['loss_giou_wgt']*loss_giou \
+                 + loss_weights['loss_MLC_wgt']*loss_MLC \
+                 + loss_weights['Loss_sim_wgt']*Loss_sim
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         
         metric_logger.update(loss_BIC=loss_BIC.item())
         metric_logger.update(loss_bbox=loss_bbox.item())
@@ -172,8 +255,8 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])         
         
-        if epoch==0 and i%step_size==0 and i<=warmup_iterations and config['schedular']['sched'] != 'cosine_in_step': 
-            scheduler.step(i//step_size)   
+        if local_epoch==0 and i%step_size==0 and i<=warmup_iterations and config['schedular']['sched'] != 'cosine_in_step':
+            scheduler.step(i//step_size)
 
         global_step+=1
         
@@ -235,7 +318,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
 
-        logits_real_fake, logits_multicls, output_coord, logits_tok, _ = model(image, label, text_input, fake_image_box, fake_token_pos, is_train=False)
+        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, is_train=False)
         # 模型一次前向返回多任务输出：
         # - logits_real_fake: 真伪二分类
         # - logits_multicls: 多标签类别预测
@@ -339,7 +422,14 @@ def main_worker(gpu, args, config):
     if gpu is not None:
         args.gpu = gpu
 
-    init_dist(args)
+    if args.distributed:
+        init_dist(args)
+    else:
+        args.rank = 0
+        args.world_size = 1
+        args.log = True
+        if torch.cuda.is_available() and args.device == 'cuda':
+            torch.cuda.set_device(args.gpu)
     # 创建当前实验日志目录，并保存运行配置
     log_dir = os.path.join(args.output_dir, 'log'+ args.log_num)
     os.makedirs(log_dir, exist_ok=True)
@@ -369,10 +459,17 @@ def main_worker(gpu, args, config):
     np.random.seed(seed)
     random.seed(seed)
     cudnn.benchmark = True
+    if config.get('enable_tf32', True) and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, 'set_float32_matmul_precision'):
+            torch.set_float32_matmul_precision('high')
     
     start_epoch = 0
     max_epoch = config['schedular']['epochs']
     warmup_steps = config['schedular']['warmup_epochs']
+    active_stage_name = None
+    active_stage_index = None
 
     #### Dataset ####
     # 构建训练集/验证集；分布式训练时为训练集创建分布式采样器
@@ -387,10 +484,13 @@ def main_worker(gpu, args, config):
 
     train_loader, val_loader = create_loader([train_dataset, val_dataset],
                                 samplers,
-                                batch_size=[config['batch_size_train']]+[config['batch_size_val']], 
-                                num_workers=[4, 4], 
-                                is_trains=[True, False], 
-                                collate_fns=[None, None])
+                                batch_size=[config['batch_size_train']]+[config['batch_size_val']],
+                                num_workers=[config.get('num_workers_train', 4), config.get('num_workers_val', 4)],
+                                is_trains=[True, False],
+                                collate_fns=[None, None],
+                                persistent_workers=[config.get('persistent_workers', False), config.get('persistent_workers', False)],
+                                prefetch_factors=[config.get('prefetch_factor', 2), config.get('prefetch_factor', 2)],
+                                pin_memory=config.get('pin_memory', True))
 
     tokenizer = RobertaTokenizerFast.from_pretrained(args.text_encoder)
     #### Model ####
@@ -398,27 +498,24 @@ def main_worker(gpu, args, config):
     if args.log:
         print(f"Creating CSCL")
     model = CSCL(args=args, config=config)
-    model = model.to(device)   
-        
-    arg_opt = utils.AttrDict(config['optimizer'])
-    optimizer = create_optimizer(arg_opt, model)
-    arg_sche = utils.AttrDict(config['schedular'])
-    lr_scheduler, _ = create_scheduler(arg_sche, optimizer)
-    if config['schedular']['sched'] == 'cosine_in_step':
-        args.lr = config['optimizer']['lr']
+    model = model.to(device)
+
+    optimizer = None
+    lr_scheduler = None
+    current_optimizer_config = None
+    current_scheduler_config = None
+    current_trainable_summary = None
     
     if args.checkpoint:
         # 可选：从 checkpoint 恢复模型；若 --resume=True 同时恢复优化器/调度器/起始 epoch
-        checkpoint = torch.load(args.checkpoint, map_location='cpu') 
-        state_dict = checkpoint['model']                       
+        checkpoint = torch.load(args.checkpoint, map_location='cpu')
+        state_dict = checkpoint['model']
         if args.resume:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            start_epoch = checkpoint['epoch']+1         
+            start_epoch = checkpoint['epoch']+1
 
-        # model.load_state_dict(state_dict)  
+        # model.load_state_dict(state_dict)
         if args.log:
-            print('load checkpoint from %s'%args.checkpoint)  
+            print('load checkpoint from %s'%args.checkpoint)
         msg = model.load_state_dict(state_dict, strict=False)
         if args.log:
             print(msg)
@@ -428,8 +525,34 @@ def main_worker(gpu, args, config):
     # - 评估时直接调用原始模型
     # - 保存权重时获取干净的 state_dict
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.gpu],
+            find_unused_parameters=config.get('find_unused_parameters', False),
+        )
         model_without_ddp = model.module
+
+    initial_stage_info = build_stage_state(config, start_epoch)
+    optimizer, lr_scheduler, current_optimizer_config, current_scheduler_config, current_trainable_summary = build_optimizer_scheduler_for_stage(config, model_without_ddp, initial_stage_info)
+    warmup_steps = current_scheduler_config['warmup_epochs']
+    active_stage_name = initial_stage_info['name']
+    active_stage_index = initial_stage_info['index']
+
+    if current_scheduler_config['sched'] == 'cosine_in_step':
+        args.lr = current_optimizer_config['lr']
+
+    scaler = GradScaler(enabled=device.type == 'cuda')
+
+    if args.checkpoint and args.resume:
+        checkpoint_stage = checkpoint.get('stage', {})
+        if checkpoint_stage.get('name') == active_stage_name:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+            if current_scheduler_config['sched'] != 'cosine_in_step' and 'lr_scheduler' in checkpoint:
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        elif args.log:
+            print('resume crosses stage boundary, rebuilding optimizer and scheduler for current stage')
 
     if args.log:
         print("Start training")
@@ -437,8 +560,18 @@ def main_worker(gpu, args, config):
 
     for epoch in range(start_epoch, max_epoch):
         # 每个 epoch：先训练，再在验证集评估，随后记录日志并保存最新 checkpoint
-            
-        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
+        stage_info = build_stage_state(config, epoch)
+        if stage_info['name'] != active_stage_name:
+            optimizer, lr_scheduler, current_optimizer_config, current_scheduler_config, current_trainable_summary = build_optimizer_scheduler_for_stage(config, model_without_ddp, stage_info)
+            warmup_steps = current_scheduler_config['warmup_epochs']
+            active_stage_name = stage_info['name']
+            active_stage_index = stage_info['index']
+            if current_scheduler_config['sched'] == 'cosine_in_step':
+                args.lr = current_optimizer_config['lr']
+            if args.log:
+                print(f"Switch to stage {active_stage_name} at epoch {epoch}, trainable params: {current_trainable_summary['trainable_params']}/{current_trainable_summary['total_params']}")
+
+        train_stats = train(args, model, train_loader, optimizer, tokenizer, scaler, epoch, warmup_steps, device, lr_scheduler, config, summary_writer, stage_info)
         AUC_cls, ACC_cls, EER_cls, \
         MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
@@ -508,7 +641,10 @@ def main_worker(gpu, args, config):
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                             **{f'val_{k}': v for k, v in val_stats.items()},
                             'epoch': epoch,
-                        }             
+                            'stage_name': stage_info['name'],
+                            'stage_index': stage_info['index'],
+                            'stage_local_epoch': stage_info['local_epoch'],
+                        }
             with open(os.path.join(log_dir, "log.txt"),"a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
@@ -517,23 +653,48 @@ def main_worker(gpu, args, config):
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
                     'config': config,
                     'epoch': epoch,
+                    'stage': {
+                        'name': stage_info['name'],
+                        'index': stage_info['index'],
+                        'start_epoch': stage_info['start_epoch'],
+                        'end_epoch': stage_info['end_epoch'],
+                        'local_epoch': stage_info['local_epoch'],
+                        'trainable_groups': stage_info.get('freeze', {}).get('trainable_groups', ['all']),
+                        'loss_weights': stage_info['loss_weights'],
+                    },
+                    'stage_optimizer_config': current_optimizer_config,
+                    'stage_scheduler_config': current_scheduler_config,
                 }
             else:
                 save_obj = {
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr': optimizer.param_groups[0]["lr"],
+                    'scaler': scaler.state_dict(),
                     'config': config,
                     'epoch': epoch,
-                }                    
+                    'stage': {
+                        'name': stage_info['name'],
+                        'index': stage_info['index'],
+                        'start_epoch': stage_info['start_epoch'],
+                        'end_epoch': stage_info['end_epoch'],
+                        'local_epoch': stage_info['local_epoch'],
+                        'trainable_groups': stage_info.get('freeze', {}).get('trainable_groups', ['all']),
+                        'loss_weights': stage_info['loss_weights'],
+                    },
+                    'stage_optimizer_config': current_optimizer_config,
+                    'stage_scheduler_config': current_scheduler_config,
+                }
 
             torch.save(save_obj, os.path.join(log_dir, 'checkpoint_latest.pth')) 
 
-        if config['schedular']['sched'] != 'cosine_in_step':
-            lr_scheduler.step(epoch+warmup_steps+1)  
-        dist.barrier() 
+        if current_scheduler_config['sched'] != 'cosine_in_step':
+            lr_scheduler.step(stage_info['local_epoch'] + warmup_steps + 1)
+        if args.distributed:
+            dist.barrier()
 
     if utils.is_main_process():
         torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch))   
@@ -574,8 +735,7 @@ if __name__ == '__main__':
 
     # main(args, config)
     if args.launcher == 'none':
-        # 兼容逻辑：未显式指定 launcher 时，默认按 pytorch 单进程入口执行
-        args.launcher = 'pytorch'
+        args.distributed = False
         main_worker(0, args, config)
     else:
         # 多 GPU 场景：为每张卡启动一个子进程，并行执行 main_worker

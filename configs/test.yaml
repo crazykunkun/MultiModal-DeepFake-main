@@ -4,8 +4,8 @@ val_file: ["../../datasets/DGM4/metadata/test.json"]
 image_res: 256
 vision_width: 768
 embed_dim: 256
-batch_size_train: 64
-batch_size_val: 256
+batch_size_train: 48
+batch_size_val: 128
 max_words: 50
 
 loss_BIC_wgt: 1
@@ -14,8 +14,14 @@ loss_giou_wgt: 0.1
 loss_MLC_wgt: 1
 Loss_sim_wgt: 10
 
-optimizer: {opt: adamW, lr: 0.00001, lr_img: 0.00005, weight_decay: 0.02}
-schedular: {sched: cosine, lr: 0.00001, epochs: 50, min_lr: 0.000001, decay_rate: 1, warmup_lr: 0.000001, warmup_epochs: 10, cooldown_epochs: 0}
+use_refactor_image_encoder: true
+use_token_patch_aligner: false
+image_feature_fusion_mode: residual
+patch_grid_size: 16
+token_output_mode: legacy
+
+optimizer: {opt: adamW, lr: 0.000008, lr_img: 0.00003, weight_decay: 0.02}
+schedular: {sched: cosine, lr: 0.000008, epochs: 50, min_lr: 0.0000008, decay_rate: 1, warmup_lr: 0.0000008, warmup_epochs: 5, cooldown_epochs: 0}
 
 
 

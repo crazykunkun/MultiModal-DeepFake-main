@@ -34,24 +34,38 @@ def create_sampler(datasets, shuffles, num_tasks, global_rank):
     return samplers     
 
 
-def create_loader(datasets, samplers, batch_size, num_workers, is_trains, collate_fns):
+def create_loader(datasets, samplers, batch_size, num_workers, is_trains, collate_fns, persistent_workers=None, prefetch_factors=None, pin_memory=True):
     loaders = []
-    for dataset,sampler,bs,n_worker,is_train,collate_fn in zip(datasets,samplers,batch_size,num_workers,is_trains,collate_fns):
+    if persistent_workers is None:
+        persistent_workers = [False] * len(datasets)
+    if prefetch_factors is None:
+        prefetch_factors = [None] * len(datasets)
+
+    for dataset, sampler, bs, n_worker, is_train, collate_fn, persistent_worker, prefetch_factor in zip(
+        datasets, samplers, batch_size, num_workers, is_trains, collate_fns, persistent_workers, prefetch_factors
+    ):
         if is_train:
             shuffle = (sampler is None)
             drop_last = True
         else:
             shuffle = False
             drop_last = False
-        loader = DataLoader(
-            dataset,
+
+        loader_kwargs = dict(
+            dataset=dataset,
             batch_size=bs,
             num_workers=n_worker,
-            pin_memory=True,
+            pin_memory=pin_memory,
             sampler=sampler,
             shuffle=shuffle,
             collate_fn=collate_fn,
             drop_last=drop_last,
-        )              
+        )
+        if n_worker > 0:
+            loader_kwargs['persistent_workers'] = persistent_worker
+            if prefetch_factor is not None:
+                loader_kwargs['prefetch_factor'] = prefetch_factor
+
+        loader = DataLoader(**loader_kwargs)
         loaders.append(loader)
-    return loaders    
+    return loaders

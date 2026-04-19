@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout *)",
+      "Bash(python \"d:/study/bishe/DEMO/code/MultiModal-DeepFake-main/models/cscl_refactor_modules.py\")",
+      "Bash(KMP_DUPLICATE_LIB_OK=TRUE python \"d:/study/bishe/DEMO/code/MultiModal-DeepFake-main/models/cscl_refactor_modules.py\")",
+      "Bash(python -m py_compile \"d:/study/bishe/DEMO/code/MultiModal-DeepFake-main/models/CSCL.py\" \"d:/study/bishe/DEMO/code/MultiModal-DeepFake-main/train.py\")",
+      "Bash(python -m py_compile \"d:/study/bishe/DEMO/code/MultiModal-DeepFake-main/train.py\" \"d:/study/bishe/DEMO/code/MultiModal-DeepFake-main/models/CSCL.py\")",
+      "Bash(git -C \"/d/study/bishe/DEMO/code/MultiModal-DeepFake-main/.claude/worktrees/agent-ab6c9b26\" status --short)",
+      "Bash(python -m py_compile \"d:/study/bishe/DEMO/code/MultiModal-DeepFake-main/train.py\")",
+      "Bash(python -m py_compile \"d:/study/bishe/DEMO/code/MultiModal-DeepFake-main/dataset/__init__.py\")",
+      "Bash(python -)",
+      "Bash(bash -n \"d:/study/bishe/DEMO/code/MultiModal-DeepFake-main/train.sh\")"
+    ]
+  }
+}

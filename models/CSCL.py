@@ -13,6 +13,7 @@ from timm.models.layers import trunc_normal_
 from .METER import METERTransformerSS
 from torch.nn import CrossEntropyLoss, BCELoss
 from .consist_modeling import Intra_Modal_Modeling, Extra_Modal_Modeling
+from .cscl_refactor_modules import CSCLSpatialFrequencyAdapter, TokenToPatchMaxSimAligner
 import math
 import yaml
 
@@ -145,7 +146,19 @@ class CSCL(nn.Module):
         # extra_modeling：跨模态语义一致性（SCD）
         self.img_extra_model = Extra_Modal_Modeling(12, vision_width, 16)
         self.text_extra_model = Extra_Modal_Modeling(12, vision_width, 8)
-        
+
+        self.use_refactor_image_encoder = config.get('use_refactor_image_encoder', False)
+        self.use_token_patch_aligner = config.get('use_token_patch_aligner', False)
+        self.image_feature_fusion_mode = config.get('image_feature_fusion_mode', 'residual')
+        self.token_output_mode = config.get('token_output_mode', 'legacy')
+        self.patch_grid_size = config.get('patch_grid_size', 16)
+        self.refactor_image_encoder = CSCLSpatialFrequencyAdapter(
+            dim=vision_width,
+            fusion_mode=self.image_feature_fusion_mode,
+            pretrained_resnet=config.get('pretrained_noise_resnet', False),
+        ) if self.use_refactor_image_encoder else None
+        self.token_patch_aligner = TokenToPatchMaxSimAligner(dim=vision_width) if self.use_token_patch_aligner else None
+
         self.emb_img_pos = nn.Sequential(
             nn.Linear(text_width*2, text_width),
             nn.LayerNorm(text_width)
@@ -161,6 +174,58 @@ class CSCL(nn.Module):
         # init METER #
         self.meter = METERTransformerSS(config_meter)
 
+    def get_trainable_groups(self):
+        groups = {
+            'meter': [self.meter],
+            'fusion_head': [self.fusion_head],
+            'bic_head': [self.itm_head],
+            'bbox_head': [self.bbox_head],
+            'mlc_heads': [self.cls_head_img, self.cls_head_text],
+            'intra_extra': [self.img_intra_model, self.text_intra_model, self.img_extra_model, self.text_extra_model],
+            'positional_embeddings': [self.emb_img_pos, self.emb_text_pos],
+        }
+        groups['heads'] = groups['fusion_head'] + groups['bic_head'] + groups['bbox_head'] + groups['mlc_heads']
+        groups['all'] = [self]
+        return groups
+
+    def set_trainable_groups(self, group_names):
+        groups = self.get_trainable_groups()
+        if isinstance(group_names, str):
+            group_names = [group_names]
+
+        for param in self.parameters():
+            param.requires_grad = False
+
+        if 'all' in group_names:
+            for param in self.parameters():
+                param.requires_grad = True
+            return self.get_trainable_summary()
+
+        for group_name in group_names:
+            if group_name not in groups:
+                raise ValueError(f'Unknown trainable group: {group_name}')
+            for module in groups[group_name]:
+                for param in module.parameters():
+                    param.requires_grad = True
+
+        return self.get_trainable_summary()
+
+    def get_trainable_summary(self):
+        trainable_params = 0
+        total_params = 0
+        trainable_names = []
+        for name, param in self.named_parameters():
+            count = param.numel()
+            total_params += count
+            if param.requires_grad:
+                trainable_params += count
+                trainable_names.append(name)
+        return {
+            'trainable_params': trainable_params,
+            'total_params': total_params,
+            'trainable_names': trainable_names,
+        }
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -169,6 +234,36 @@ class CSCL(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    def _encode_meter_features(self, image, text):
+        batch = {
+            "text_ids": text.input_ids,
+            "text_masks": text.attention_mask,
+        }
+        outputs = self.meter.infer(batch=batch, img=image)
+        text_embeds_output = outputs['text_feats']
+        image_embeds_output = outputs['image_feats']
+        fusion_token = self.fusion_head(outputs['cls_feats'])
+        return text_embeds_output, image_embeds_output, fusion_token, outputs
+
+    def _build_image_features(self, image, image_embeds_output):
+        img_global_feat = image_embeds_output[:, 0:1, :]
+        img_patch_feat = image_embeds_output[:, 1:, :]
+        image_atts = torch.ones((image_embeds_output.size(0), img_patch_feat.size(1) + 1), dtype=torch.long, device=image.device)
+        image_atts_mask_bool = (image_atts == 0)
+
+        refactor_outputs = None
+        if self.refactor_image_encoder is not None:
+            refactor_outputs = self.refactor_image_encoder(image, img_patch_feat, img_global_feat)
+            img_patch_feat = refactor_outputs['refined_patch_tokens']
+            img_global_feat = refactor_outputs['refined_global_token']
+
+        patch_pos_emb = self.emb_img_pos(
+            pos2posemb2d(
+                coords_2d(self.patch_grid_size, self.patch_grid_size).to(image.device).unsqueeze(0).repeat(image.size(0), 1, 1)
+            )
+        )
+        return img_global_feat, img_patch_feat, image_atts_mask_bool, patch_pos_emb, refactor_outputs
 
     def build_mlp(self, input_dim, output_dim):
         return nn.Sequential(
@@ -253,14 +348,7 @@ class CSCL(nn.Module):
             sim_matrix_text, sim_matrix_text_mask = get_sscore_label_text(token_label)
             ##================= METER ========================##
             # 多模态编码：提取 text/image 细粒度特征与融合 cls 特征
-            batch={}
-            batch["text_ids"] = text.input_ids
-            batch["text_masks"] = text.attention_mask
-
-            outputs = self.meter.infer(batch=batch, img=image)
-            text_embeds_output = outputs['text_feats']
-            image_embeds_output = outputs['image_feats']
-            fusion_token = self.fusion_head(outputs['cls_feats'])
+            text_embeds_output, image_embeds_output, fusion_token, _ = self._encode_meter_features(image, text)
  
             ##================= BIC ========================##
             # 二分类分支：预测图文对是否为真实一致对
@@ -274,10 +362,7 @@ class CSCL(nn.Module):
             loss_BIC = F.cross_entropy(vl_output, itm_labels) 
 
             ##============ contextual consistancy ===========##
-            image_atts = torch.ones(image_embeds_output.size()[:-1],dtype=torch.long).to(image.device)
-            image_atts_mask_bool = (image_atts==0)
-            patch_pos_emb = self.emb_img_pos(pos2posemb2d(coords_2d(16, 16).to(fusion_token.device).unsqueeze(0).repeat(bs,1,1)))
-            img_patch_feat = image_embeds_output[:,1:,:]
+            img_global_feat, img_patch_feat, image_atts_mask_bool, patch_pos_emb, _ = self._build_image_features(image, image_embeds_output)
             img_patch_feat, img_matrix_pred, _ = self.img_intra_model(img_patch_feat, image_atts_mask_bool[:,1:], patch_pos_emb)
             len_text = text_embeds_output.shape[1]-1
             token_pos_emb = self.emb_text_pos(score2posemb1d(torch.arange(0, len_text, dtype=torch.float).to(text_embeds_output.device).unsqueeze(1).repeat(bs,1,1)))
@@ -288,8 +373,12 @@ class CSCL(nn.Module):
             Loss_text_matrix, _, _ =  get_weighted_bce_loss(text_matrix_pred[sim_matrix_text_mask].view(-1), sim_matrix_text[sim_matrix_text_mask].view(-1).float())
 
             ##============ semantic consistancy ===========##
-            agger_feat_img, sim_score_img, _ = self.img_extra_model(img_patch_feat, image_embeds_output[:,0:1,:], text_token_feat, image_atts_mask_bool[:,1:], text_atts_mask_bool[:,1:])
+            agger_feat_img, sim_score_img, _ = self.img_extra_model(img_patch_feat, img_global_feat, text_token_feat, image_atts_mask_bool[:,1:], text_atts_mask_bool[:,1:])
             agger_feat_text, sim_score_text, _ = self.text_extra_model(text_token_feat, text_embeds_output[:,0:1,:], img_patch_feat, text_atts_mask_bool[:,1:], image_atts_mask_bool[:,1:])
+
+            if self.token_patch_aligner is not None:
+                aligner_outputs = self.token_patch_aligner(img_patch_feat, text_token_feat, 1 - text_atts_mask_bool[:,1:].long())
+                sim_score_text = aligner_outputs['token_maxsim']
 
             Loss_img_score, _, _ = get_it_bce_loss(sim_score_img.view(-1), patch_label.view(-1).float())
             Loss_text_score, _, _ = get_it_bce_loss(sim_score_text.view(-1), token_label.view(-1).float())
@@ -321,14 +410,7 @@ class CSCL(nn.Module):
             sim_matrix_text_mask = ((text_atts_mask_bool[:,1:].unsqueeze(-1) + text_atts_mask_bool[:,1:].unsqueeze(-1).transpose(2,1))==0)
             ##================= METER ========================##
             # 多模态编码：提取 text/image 细粒度特征与融合 cls 特征
-            batch={}
-            batch["text_ids"] = text.input_ids
-            batch["text_masks"] = text.attention_mask
-
-            outputs = self.meter.infer(batch=batch, img=image)
-            text_embeds_output = outputs['text_feats']
-            image_embeds_output = outputs['image_feats']
-            fusion_token = self.fusion_head(outputs['cls_feats'])
+            text_embeds_output, image_embeds_output, fusion_token, _ = self._encode_meter_features(image, text)
  
             ##================= BIC ========================##
             # 二分类分支：预测图文对是否为真实一致对
@@ -339,10 +421,7 @@ class CSCL(nn.Module):
             logits_real_fake = self.itm_head(fusion_token)   
 
             ##============ contextual consistancy ===========##
-            image_atts = torch.ones(image_embeds_output.size()[:-1],dtype=torch.long).to(image.device)
-            image_atts_mask_bool = (image_atts==0)
-            patch_pos_emb = self.emb_img_pos(pos2posemb2d(coords_2d(16, 16).to(fusion_token.device).unsqueeze(0).repeat(bs,1,1)))
-            img_patch_feat = image_embeds_output[:,1:,:]
+            img_global_feat, img_patch_feat, image_atts_mask_bool, patch_pos_emb, _ = self._build_image_features(image, image_embeds_output)
             img_patch_feat, img_matrix_pred, _ = self.img_intra_model(img_patch_feat, image_atts_mask_bool[:,1:], patch_pos_emb)
             len_text = text_embeds_output.shape[1]-1
             token_pos_emb = self.emb_text_pos(score2posemb1d(torch.arange(0, len_text, dtype=torch.float).to(text_embeds_output.device).unsqueeze(1).repeat(bs,1,1)))
@@ -350,8 +429,12 @@ class CSCL(nn.Module):
             text_token_feat, text_matrix_pred, _ = self.text_intra_model(text_token_feat, text_atts_mask_bool[:,1:], token_pos_emb, sim_matrix_text_mask)
 
             ##============ semantic consistancy ===========##
-            agger_feat_img, sim_score_img, _ = self.img_extra_model(img_patch_feat, image_embeds_output[:,0:1,:], text_token_feat, image_atts_mask_bool[:,1:], text_atts_mask_bool[:,1:])
+            agger_feat_img, sim_score_img, _ = self.img_extra_model(img_patch_feat, img_global_feat, text_token_feat, image_atts_mask_bool[:,1:], text_atts_mask_bool[:,1:])
             agger_feat_text, sim_score_text, _ = self.text_extra_model(text_token_feat, text_embeds_output[:,0:1,:], img_patch_feat, text_atts_mask_bool[:,1:], image_atts_mask_bool[:,1:])
+
+            if self.token_patch_aligner is not None:
+                aligner_outputs = self.token_patch_aligner(img_patch_feat, text_token_feat, 1 - text_atts_mask_bool[:,1:].long())
+                sim_score_text = aligner_outputs['token_maxsim']
 
             ##================= IMG ========================##
             output_coord = self.bbox_head(agger_feat_img.squeeze(1)).sigmoid()
@@ -359,11 +442,14 @@ class CSCL(nn.Module):
             ##================= TMG ========================##  
             logits_multicls_text = self.cls_head_text(agger_feat_text.squeeze(1))
             ##==============logit merge=====================##
-            it_sim_score = torch.clamp(sim_score_text, 0, 1).unsqueeze(-1)
-            it_sim_score = (it_sim_score > 0.5).float() # threshold is 0.5
-            it_sim_score_convert = 1 - it_sim_score
-            it_sim_score = torch.cat([it_sim_score, it_sim_score_convert], dim=-1)
-            logits_tok = it_sim_score
+            if self.token_patch_aligner is not None and self.token_output_mode == 'aligner':
+                aligner_outputs = self.token_patch_aligner(img_patch_feat, text_token_feat, 1 - text_atts_mask_bool[:,1:].long())
+                logits_tok = aligner_outputs['token_logits']
+            else:
+                it_sim_score = torch.clamp(sim_score_text, 0, 1).unsqueeze(-1)
+                it_sim_score = (it_sim_score > 0.5).float() # threshold is 0.5
+                it_sim_score_convert = 1 - it_sim_score
+                logits_tok = torch.cat([it_sim_score_convert, it_sim_score], dim=-1)
 
             ##================= MLC ========================## 
             logits_multicls = torch.cat([logits_multicls_img, logits_multicls_text], dim=-1)
